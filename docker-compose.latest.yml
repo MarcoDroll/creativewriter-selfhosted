@@ -1,0 +1,356 @@
+services:
+  # ─── Frontend (Angular SPA + nginx reverse proxy) ───
+  frontend:
+    image: ghcr.io/marcodroll/creativewriter-selfhosted:latest
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    environment:
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:3000}
+      ANON_KEY: ${ANON_KEY}
+      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}
+      STRIPE_PRICING_TABLE_ID: ${STRIPE_PRICING_TABLE_ID:-}
+    depends_on:
+      kong:
+        condition: service_started
+    networks:
+      - creativewriter
+
+  # ─── PostgreSQL Database ───
+  db:
+    image: supabase/postgres:15.8.1.085
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data:Z
+      - ./volumes/db/init/zz-bootstrap.sh:/docker-entrypoint-initdb.d/zz-bootstrap.sh:ro
+      - ./volumes/db/init/99-creativewriter-schema.sql:/docker-entrypoint-initdb.d/init-scripts/99-creativewriter-schema.sql:ro
+      - ./volumes/db/init/99-storage-setup.sql:/docker-entrypoint-initdb.d/init-scripts/99-storage-setup.sql:ro
+      - ./volumes/db/init/99-storage-setup.sql:/docker-entrypoint-initdb.d/99-storage-setup.sql:ro
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: "5432"
+      POSTGRES_PORT: "5432"
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: postgres
+      POSTGRES_DB: postgres
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: "3600"
+    command:
+      - postgres
+      - -c
+      - listen_addresses=*
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supabase_admin -h localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - creativewriter
+
+  # ─── Supabase Auth (GoTrue) ───
+  auth:
+    image: supabase/gotrue:v2.186.0
+    restart: unless-stopped
+    environment:
+      GOTRUE_API_HOST: "0.0.0.0"
+      GOTRUE_API_PORT: "9999"
+      API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:3000}
+
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+
+      GOTRUE_SITE_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:3000}
+      GOTRUE_URI_ALLOW_LIST: ""
+      GOTRUE_DISABLE_SIGNUP: "${DISABLE_SIGNUP:-false}"
+
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: "3600"
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "${MAILER_AUTOCONFIRM:-false}"
+      GOTRUE_SMTP_HOST: ${SMTP_HOST:-}
+      GOTRUE_SMTP_PORT: ${SMTP_PORT:-587}
+      GOTRUE_SMTP_USER: ${SMTP_USER:-}
+      GOTRUE_SMTP_PASS: ${SMTP_PASS:-}
+      GOTRUE_SMTP_SENDER_NAME: CreativeWriter
+      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_SENDER_EMAIL:-noreply@example.com}
+      GOTRUE_MAILER_URLPATHS_INVITE: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_RECOVERY: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: /auth/v1/verify
+
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - creativewriter
+
+  # ─── PostgREST (REST API) ───
+  rest:
+    image: postgrest/postgrest:v14.5
+    restart: unless-stopped
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public,storage
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: "3600"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - creativewriter
+
+  # ─── Supabase Realtime ───
+  realtime:
+    image: supabase/realtime:v2.76.5
+    restart: unless-stopped
+    environment:
+      PORT: "4000"
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: postgres
+      DB_AFTER_CONNECT_QUERY: "SET search_path TO _realtime"
+      DB_ENC_KEY: ${DB_ENC_KEY:-supabaserealtime}
+      API_JWT_SECRET: ${JWT_SECRET}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-UpNVntn3cDxHJpq99YMc1T1AQgQpc8kfYTuRgBiYa15BLrx8etQoXz3gZv1/u2oq}
+      APP_NAME: realtime
+      SEED_SELF_HOST: "true"
+      SELF_HOST_TENANT_NAME: "realtime"
+      RUN_JANITOR: "true"
+      ERL_AFLAGS: "-proto_dist inet_tcp"
+      ENABLE_TAILSCALE: "false"
+      DNS_NODES: "''"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - creativewriter
+
+  # ─── Supabase Storage ───
+  storage:
+    image: supabase/storage-api:v1.37.8
+    restart: unless-stopped
+    volumes:
+      - storage-data:/var/lib/storage:z
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      FILE_SIZE_LIMIT: "52428800"
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: stub
+      REGION: stub
+      GLOBAL_S3_BUCKET: stub
+      IS_MULTITENANT: "false"
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      POSTGREST_URL: http://rest:3000
+      IMGPROXY_URL: ${IMGPROXY_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_started
+    networks:
+      - creativewriter
+
+  # ─── Storage Bucket Init (one-shot) ───
+  # Creates storage buckets and RLS policies after the storage service is ready.
+  # Retries until the storage schema exists (created by the storage service on first boot).
+  storage-init:
+    image: supabase/postgres:15.8.1.085
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Waiting for storage schema to be ready..."
+        for i in $(seq 1 30); do
+          if psql -h db -U supabase_admin -d postgres -tAc \
+            "SELECT 1 FROM information_schema.tables WHERE table_schema='storage' AND table_name='buckets'" 2>/dev/null | grep -q 1; then
+            echo "Storage schema ready — running bucket setup..."
+            psql -h db -U supabase_admin -d postgres -f /sql/99-storage-setup.sql
+            echo "Storage buckets initialized successfully."
+            exit 0
+          fi
+          echo "  Attempt $i/30 — storage schema not ready yet, retrying in 3s..."
+          sleep 3
+        done
+        echo "ERROR: storage schema did not appear after 90s. Run manually:"
+        echo "  docker compose exec db psql -U supabase_admin -f /docker-entrypoint-initdb.d/99-storage-setup.sql"
+        exit 1
+    volumes:
+      - ./volumes/db/init/99-storage-setup.sql:/sql/99-storage-setup.sql:ro
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      storage:
+        condition: service_started
+      db:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - creativewriter
+
+  # ─── Image Proxy (optional) ───
+  imgproxy:
+    image: darthsim/imgproxy:v3.8.0
+    restart: unless-stopped
+    profiles:
+      - imgproxy
+    environment:
+      IMGPROXY_BIND: ":8080"
+      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /
+      IMGPROXY_USE_ETAG: "true"
+    volumes:
+      - storage-data:/var/lib/storage:ro
+    networks:
+      - creativewriter
+
+  # ─── Edge Functions (Deno Runtime) ───
+  functions:
+    image: supabase/edge-runtime:v1.70.3
+    restart: unless-stopped
+    command: ["start", "--main-service", "/home/deno/functions/main"]
+    volumes:
+      - ./functions:/home/deno/functions:ro
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:3000}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/postgres
+      VERIFY_JWT: "false"
+      SELF_HOSTED: "true"
+      NO_MODULE_CACHE: "${NO_MODULE_CACHE:-true}"
+      # Stripe (optional)
+      STRIPE_API_KEY: ${STRIPE_API_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_BASIC_PRICE_ID_MONTHLY: ${STRIPE_BASIC_PRICE_ID_MONTHLY:-}
+      STRIPE_BASIC_PRICE_ID_YEARLY: ${STRIPE_BASIC_PRICE_ID_YEARLY:-}
+      STRIPE_PREMIUM_PRICE_ID_MONTHLY: ${STRIPE_PREMIUM_PRICE_ID_MONTHLY:-}
+      STRIPE_PREMIUM_PRICE_ID_YEARLY: ${STRIPE_PREMIUM_PRICE_ID_YEARLY:-}
+      STRIPE_TRIAL_DAYS: ${STRIPE_TRIAL_DAYS:-7}
+      SUCCESS_URL: ${SUCCESS_URL:-http://localhost:3000/?subscription=success}
+      # AI proxy keys (optional)
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      # Self-hosted license key (alternative to Stripe)
+      LICENSE_KEY: ${LICENSE_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      kong:
+        condition: service_started
+    networks:
+      - creativewriter
+
+  # ─── Database Migrations (one-shot) ───
+  migrate:
+    image: supabase/postgres:15.8.1.085
+    volumes:
+      - ./volumes/db/migrations:/migrations:ro
+      - ./volumes/db/migrate.sh:/migrate.sh:ro
+    entrypoint: ["/bin/bash", "/migrate.sh"]
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-postgres}
+      PGUSER: supabase_admin
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - creativewriter
+
+  # ─── Kong API Gateway ───
+  kong:
+    image: kong:2.8.1
+    restart: unless-stopped
+    entrypoint: bash -c 'sed -e "s|\$${ANON_KEY}|$$ANON_KEY|g" -e "s|\$${SERVICE_ROLE_KEY}|$$SERVICE_ROLE_KEY|g" ~/temp.yml > ~/kong.yml && /docker-entrypoint.sh kong docker-start'
+    volumes:
+      - ./volumes/api/kong.yml:/home/kong/temp.yml:ro
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+    depends_on:
+      auth:
+        condition: service_started
+      rest:
+        condition: service_started
+      storage:
+        condition: service_started
+    networks:
+      - creativewriter
+
+  # ─── Supabase Studio (admin UI) ───
+  studio:
+    image: supabase/studio:20240326-5e5586d
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${STUDIO_PORT:-54323}:3000"
+    environment:
+      STUDIO_PG_META_URL: http://meta:8080
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DEFAULT_ORGANIZATION_NAME: CreativeWriter
+      DEFAULT_PROJECT_NAME: CreativeWriter
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:3000}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+    depends_on:
+      kong:
+        condition: service_started
+      meta:
+        condition: service_started
+    networks:
+      - creativewriter
+
+  # ─── PG Meta (required for Studio) ───
+  meta:
+    image: supabase/postgres-meta:v0.84.2
+    restart: unless-stopped
+    environment:
+      PG_META_PORT: "8080"
+      PG_META_DB_HOST: db
+      PG_META_DB_PORT: "5432"
+      PG_META_DB_NAME: postgres
+      PG_META_DB_USER: supabase_admin
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - creativewriter
+
+volumes:
+  db-data:
+  storage-data:
+
+networks:
+  creativewriter:
+    driver: bridge
