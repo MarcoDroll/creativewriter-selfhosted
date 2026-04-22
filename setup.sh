@@ -74,7 +74,9 @@ SERVICE_ROLE_KEY=$(sign_jwt "service_role")
 
 # Generate optional security keys
 SECRET_KEY_BASE=$(openssl rand -base64 48 | tr -d '\n')
-DB_ENC_KEY=$(openssl rand -hex 16)
+# Realtime uses AES-128-ECB, which requires a 16-byte key.
+# `openssl rand -hex 8` emits 16 ASCII chars = 16 bytes.
+DB_ENC_KEY=$(openssl rand -hex 8)
 
 # ── Self-test: verify JWT header decodes correctly ────────────
 
