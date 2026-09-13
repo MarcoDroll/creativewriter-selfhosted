@@ -1,0 +1,7 @@
+{
+  "imports": {
+    "npm:stripe@17": "npm:stripe@^17",
+    "npm:jose@6": "npm:jose@^6",
+    "npm:@supabase/supabase-js@2": "npm:@supabase/supabase-js@^2"
+  }
+}
